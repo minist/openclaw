@@ -665,27 +665,6 @@ export async function preflightDiscordMessage(
   logDebug(
     `[discord-preflight] shouldRequireMention=${shouldRequireMention} baseRequireMention=${shouldRequireMentionByConfig} boundThreadSession=${isBoundThreadSession} mentionDecision.shouldSkip=${mentionDecision.shouldSkip} wasMentioned=${wasMentioned}`,
   );
-  if (isGuildMessage && shouldRequireMention) {
-    if (mentionDecision.shouldSkip) {
-      logDebug(`[discord-preflight] drop: no-mention`);
-      logVerbose(`discord: drop guild message (mention required, botId=${botId ?? "<missing>"})`);
-      logger.info(
-        {
-          channelId: messageChannelId,
-          reason: "no-mention",
-        },
-        "discord: skipping guild message",
-      );
-      await recordDiscordPendingHistoryEntry({
-        preflight: params,
-        historyKey: messageChannelId,
-        message,
-        entry: historyEntry,
-      });
-      return null;
-    }
-  }
-
   if (author.bot && !sender.isPluralKit && allowBotsMode === "mentions") {
     const botMentioned = isDirectMessage || wasMentioned || mentionDecision.implicitMention;
     if (!botMentioned) {
@@ -750,6 +729,43 @@ export async function preflightDiscordMessage(
       return null;
     }
   }
+
+  const passiveCaptureAdmission = {
+    guildId: params.data.guild_id,
+    sourceChannelId: messageChannelId,
+    resolvedMessageId: message.id,
+    resolvedContent: messageText,
+    authorId: author.id,
+    authorIsBot: Boolean(author.bot),
+    sender,
+    threadChannel,
+    threadParentId,
+  };
+
+  if (isGuildMessage && shouldRequireMention) {
+    if (mentionDecision.shouldSkip) {
+      if (inboundEventKind === "room_event") {
+        params.onPassiveCaptureAdmissionResolved?.(passiveCaptureAdmission);
+      }
+      logDebug(`[discord-preflight] drop: no-mention`);
+      logVerbose(`discord: drop guild message (mention required, botId=${botId ?? "<missing>"})`);
+      logger.info(
+        {
+          channelId: messageChannelId,
+          reason: "no-mention",
+        },
+        "discord: skipping guild message",
+      );
+      await recordDiscordPendingHistoryEntry({
+        preflight: params,
+        historyKey: messageChannelId,
+        message,
+        entry: historyEntry,
+      });
+      return null;
+    }
+  }
+  params.onPassiveCaptureAdmissionResolved?.(passiveCaptureAdmission);
 
   const botLoopProtection =
     author.bot &&

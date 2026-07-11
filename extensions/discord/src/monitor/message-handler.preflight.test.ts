@@ -36,6 +36,10 @@ import {
   registerSessionBindingAdapter,
 } from "openclaw/plugin-sdk/conversation-runtime";
 import {
+  captureAcceptedAgentWorkerDiscordMessage,
+  type DiscordPassiveCaptureAdmission,
+} from "./message-handler.passive-capture.js";
+import {
   createDiscordMessage,
   createDiscordPreflightArgs,
   createGuildEvent,
@@ -45,6 +49,7 @@ import {
   type DiscordConfig,
   type DiscordMessageEvent,
 } from "./message-handler.preflight.test-helpers.js";
+import { resetDiscordChannelInfoCacheForTest } from "./message-utils.js";
 let preflightDiscordMessage: typeof import("./message-handler.preflight.js").preflightDiscordMessage;
 let resolvePreflightMentionRequirement: typeof import("./message-handler.preflight.js").resolvePreflightMentionRequirement;
 let shouldIgnoreBoundThreadWebhookMessage: typeof import("./message-handler.preflight.js").shouldIgnoreBoundThreadWebhookMessage;
@@ -127,6 +132,44 @@ function firstMockArg(mock: MockWithCalls, label: string) {
     throw new Error(`expected ${label} call`);
   }
   return call[0];
+}
+
+function createAgentWorkerCapture(fetchImpl: typeof fetch) {
+  return {
+    env: {
+      AGENT_WORKER_BASE_URL: "http://worker:8788",
+      AGENT_WORKER_BRIDGE_TOKEN: "test-token",
+      AGENT_WORKER_WORKSPACE_KEY: "homming",
+    },
+    fetchImpl,
+  };
+}
+
+function recordPassiveCaptureForMessage(params: {
+  fetchImpl: typeof fetch;
+  message: import("../internal/discord.js").Message;
+}) {
+  return (admission: DiscordPassiveCaptureAdmission) => {
+    void captureAcceptedAgentWorkerDiscordMessage({
+      capture: createAgentWorkerCapture(params.fetchImpl),
+      ...admission,
+      messageId: params.message.id,
+      content: params.message.content,
+    });
+  };
+}
+
+function parseFirstCaptureBody(fetchImpl: { mock: { calls: unknown[][] } }) {
+  const request = fetchImpl.mock.calls[0]?.[1] as RequestInit | undefined;
+  if (!request) {
+    throw new Error("expected capture request");
+  }
+  return JSON.parse(String(request.body)) as Record<string, unknown>;
+}
+
+async function flushPassiveCapture() {
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
 function createThreadClient(params: { threadId: string; parentId: string }): DiscordClient {
@@ -344,6 +387,7 @@ describe("resolvePreflightMentionRequirement", () => {
 
 describe("preflightDiscordMessage", () => {
   beforeEach(() => {
+    resetDiscordChannelInfoCacheForTest();
     sessionBindingTesting.resetSessionBindingAdaptersForTests();
     transcribeFirstAudioMock.mockReset();
     resolveDiscordDmCommandAccessMock.mockReset();
@@ -1267,6 +1311,750 @@ describe("preflightDiscordMessage", () => {
     expect(preflight.commandAuthorized).toBe(true);
     expect(preflight.shouldRequireMention).toBe(true);
     expect(preflight.shouldBypassMention).toBe(true);
+  });
+
+  it("does not passively capture default user-request guild chatter rejected by the mention gate", async () => {
+    const channelId = "channel-passive-default-no-mention";
+    const guildId = "guild-passive-default-no-mention";
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const message = createDiscordMessage({
+      id: "m-passive-default-no-mention",
+      channelId,
+      content: "default room update without bot mention",
+      author: {
+        id: "user-1",
+        bot: false,
+        username: "Alice",
+      },
+    });
+
+    const result = await preflightDiscordMessage({
+      ...createPreflightArgs({
+        cfg: DEFAULT_PREFLIGHT_CFG,
+        discordConfig: {} as DiscordConfig,
+        data: createGuildEvent({
+          channelId,
+          guildId,
+          author: message.author,
+          message,
+        }),
+        client: createGuildTextClient(channelId),
+      }),
+      guildEntries: {
+        [guildId]: {
+          channels: {
+            [channelId]: {
+              enabled: true,
+              requireMention: true,
+            },
+          },
+        },
+      },
+      agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+      onPassiveCaptureAdmissionResolved: recordPassiveCaptureForMessage({
+        fetchImpl: fetchImpl as never,
+        message,
+      }),
+    });
+
+    expect(result).toBeNull();
+    await flushPassiveCapture();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("passively captures a room-event guild message rejected solely by the mention gate", async () => {
+    const channelId = "channel-passive-capture";
+    const guildId = "guild-passive-capture";
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const message = createDiscordMessage({
+      id: "m-passive-capture",
+      channelId,
+      content: "room update without bot mention",
+      author: {
+        id: "user-1",
+        bot: false,
+        username: "Alice",
+      },
+    });
+
+    const result = await preflightDiscordMessage({
+      ...createPreflightArgs({
+        cfg: {
+          ...DEFAULT_PREFLIGHT_CFG,
+          messages: {
+            groupChat: {
+              unmentionedInbound: "room_event",
+            },
+          },
+        },
+        discordConfig: {} as DiscordConfig,
+        data: createGuildEvent({
+          channelId,
+          guildId,
+          author: message.author,
+          message,
+        }),
+        client: createGuildTextClient(channelId),
+      }),
+      guildEntries: {
+        [guildId]: {
+          channels: {
+            [channelId]: {
+              enabled: true,
+              requireMention: true,
+            },
+          },
+        },
+      },
+      agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+      onPassiveCaptureAdmissionResolved: recordPassiveCaptureForMessage({
+        fetchImpl: fetchImpl as never,
+        message,
+      }),
+    });
+
+    expect(result).toBeNull();
+    await flushPassiveCapture();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledWith(
+      "http://worker:8788/api/conversation-capture",
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-agent-worker-bridge-token": "test-token",
+        },
+      }),
+    );
+    expect(parseFirstCaptureBody(fetchImpl)).toMatchObject({
+      platform: "discord",
+      workspace_key: "homming",
+      guild_id: guildId,
+      channel_id: channelId,
+      channel_type: "text",
+      message_id: "m-passive-capture",
+      author_id: "user-1",
+      content: "room update without bot mention",
+      task_candidate: false,
+      reply_required: false,
+    });
+  });
+
+  it("does not passively capture unauthorized guild text control commands", async () => {
+    const channelId = "channel-passive-control-command";
+    const guildId = "guild-passive-control-command";
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const message = createDiscordMessage({
+      id: "m-passive-control-command",
+      channelId,
+      content: "/steer keep digging",
+      author: {
+        id: "user-1",
+        bot: false,
+        username: "Alice",
+      },
+    });
+
+    const result = await preflightDiscordMessage({
+      ...createPreflightArgs({
+        cfg: DEFAULT_PREFLIGHT_CFG,
+        discordConfig: {} as DiscordConfig,
+        data: createGuildEvent({
+          channelId,
+          guildId,
+          author: message.author,
+          message,
+        }),
+        client: createGuildTextClient(channelId),
+      }),
+      allowFrom: ["discord:owner-only"],
+      guildEntries: {
+        [guildId]: {
+          channels: {
+            [channelId]: {
+              enabled: true,
+              requireMention: false,
+            },
+          },
+        },
+      },
+      agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+      onPassiveCaptureAdmissionResolved: recordPassiveCaptureForMessage({
+        fetchImpl: fetchImpl as never,
+        message,
+      }),
+    });
+
+    expect(result).toBeNull();
+    await flushPassiveCapture();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("does not passively capture guild messages ignored for mentioning another user", async () => {
+    const channelId = "channel-passive-other-mention";
+    const guildId = "guild-passive-other-mention";
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const message = createDiscordMessage({
+      id: "m-passive-other-mention",
+      channelId,
+      content: "can someone ask <@other-user>?",
+      mentionedUsers: [{ id: "other-user" }],
+      author: {
+        id: "user-1",
+        bot: false,
+        username: "Alice",
+      },
+    });
+
+    const result = await preflightDiscordMessage({
+      ...createPreflightArgs({
+        cfg: DEFAULT_PREFLIGHT_CFG,
+        discordConfig: {} as DiscordConfig,
+        data: createGuildEvent({
+          channelId,
+          guildId,
+          author: message.author,
+          message,
+        }),
+        client: createGuildTextClient(channelId),
+      }),
+      guildEntries: {
+        [guildId]: {
+          channels: {
+            [channelId]: {
+              enabled: true,
+              requireMention: false,
+              ignoreOtherMentions: true,
+            },
+          },
+        },
+      },
+      agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+      onPassiveCaptureAdmissionResolved: recordPassiveCaptureForMessage({
+        fetchImpl: fetchImpl as never,
+        message,
+      }),
+    });
+
+    expect(result).toBeNull();
+    await flushPassiveCapture();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("passively captures normally accepted mentioned guild messages once", async () => {
+    const channelId = "channel-passive-mentioned";
+    const guildId = "guild-passive-mentioned";
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const message = createDiscordMessage({
+      id: "m-passive-mentioned",
+      channelId,
+      content: "room update with bot mention",
+      mentionedUsers: [{ id: "openclaw-bot" }],
+      author: {
+        id: "user-1",
+        bot: false,
+        username: "Alice",
+      },
+    });
+
+    const result = await preflightDiscordMessage({
+      ...createPreflightArgs({
+        cfg: DEFAULT_PREFLIGHT_CFG,
+        discordConfig: {} as DiscordConfig,
+        data: createGuildEvent({
+          channelId,
+          guildId,
+          author: message.author,
+          message,
+        }),
+        client: createGuildTextClient(channelId),
+      }),
+      guildEntries: {
+        [guildId]: {
+          channels: {
+            [channelId]: {
+              enabled: true,
+              requireMention: true,
+            },
+          },
+        },
+      },
+      agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+      onPassiveCaptureAdmissionResolved: recordPassiveCaptureForMessage({
+        fetchImpl: fetchImpl as never,
+        message,
+      }),
+    });
+
+    expect(expectPreflightResult(result).message.id).toBe("m-passive-mentioned");
+    await flushPassiveCapture();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(parseFirstCaptureBody(fetchImpl)).toMatchObject({
+      guild_id: guildId,
+      channel_id: channelId,
+      channel_type: "text",
+      message_id: "m-passive-mentioned",
+      content: "room update with bot mention",
+    });
+  });
+
+  it("passively captures accepted PluralKit guild messages from bot-authored webhooks", async () => {
+    fetchPluralKitMessageInfoMock.mockResolvedValue({
+      id: "m-passive-pluralkit",
+      original: "orig-passive-pluralkit",
+      member: { id: "pk-member-passive", name: "Echo" },
+      system: { id: "pk-system-passive", name: "System" },
+    });
+    const channelId = "channel-passive-pluralkit";
+    const guildId = "guild-passive-pluralkit";
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const message = createDiscordMessage({
+      id: "m-passive-pluralkit",
+      channelId,
+      content: "proxied guild update",
+      webhookId: "pluralkit-webhook-passive",
+      author: {
+        id: "pluralkit-bot-author",
+        bot: true,
+        username: "PluralKit",
+      },
+    });
+
+    const result = await preflightDiscordMessage({
+      ...createPreflightArgs({
+        cfg: DEFAULT_PREFLIGHT_CFG,
+        discordConfig: {
+          pluralkit: { enabled: true },
+        } as DiscordConfig,
+        data: createGuildEvent({
+          channelId,
+          guildId,
+          author: message.author,
+          message,
+        }),
+        client: createGuildTextClient(channelId),
+      }),
+      guildEntries: {
+        [guildId]: {
+          channels: {
+            [channelId]: {
+              enabled: true,
+              requireMention: false,
+            },
+          },
+        },
+      },
+      agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+      onPassiveCaptureAdmissionResolved: recordPassiveCaptureForMessage({
+        fetchImpl: fetchImpl as never,
+        message,
+      }),
+    });
+
+    expect(expectPreflightResult(result).sender.isPluralKit).toBe(true);
+    await flushPassiveCapture();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(parseFirstCaptureBody(fetchImpl)).toMatchObject({
+      guild_id: guildId,
+      channel_id: channelId,
+      channel_type: "text",
+      message_id: "m-passive-pluralkit",
+      author_id: "pluralkit-bot-author",
+      author_name: "Echo (PK:System)",
+      content: "proxied guild update",
+    });
+  });
+
+  it("does not passively capture accepted ordinary bot-authored guild messages", async () => {
+    const channelId = "channel-passive-bot";
+    const guildId = "guild-passive-bot";
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const message = createDiscordMessage({
+      id: "m-passive-bot",
+      channelId,
+      content: "ordinary bot update",
+      author: {
+        id: "ordinary-bot-author",
+        bot: true,
+        username: "BuildBot",
+      },
+    });
+
+    const result = await preflightDiscordMessage({
+      ...createPreflightArgs({
+        cfg: DEFAULT_PREFLIGHT_CFG,
+        discordConfig: {
+          allowBots: true,
+          pluralkit: { enabled: true },
+        } as DiscordConfig,
+        data: createGuildEvent({
+          channelId,
+          guildId,
+          author: message.author,
+          message,
+        }),
+        client: createGuildTextClient(channelId),
+      }),
+      guildEntries: {
+        [guildId]: {
+          channels: {
+            [channelId]: {
+              enabled: true,
+              requireMention: false,
+            },
+          },
+        },
+      },
+      agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+      onPassiveCaptureAdmissionResolved: recordPassiveCaptureForMessage({
+        fetchImpl: fetchImpl as never,
+        message,
+      }),
+    });
+
+    const preflight = expectPreflightResult(result);
+    expect(preflight.sender.isPluralKit).toBe(false);
+    await flushPassiveCapture();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("does not passively capture rejected guild or channel messages", async () => {
+    const channelId = "channel-passive-reject";
+    const guildId = "guild-passive-reject";
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const message = createDiscordMessage({
+      id: "m-passive-reject",
+      channelId,
+      content: "blocked room update",
+      author: {
+        id: "user-1",
+        bot: false,
+        username: "Alice",
+      },
+    });
+
+    const result = await preflightDiscordMessage({
+      ...createPreflightArgs({
+        cfg: DEFAULT_PREFLIGHT_CFG,
+        discordConfig: {} as DiscordConfig,
+        data: createGuildEvent({
+          channelId,
+          guildId,
+          author: message.author,
+          message,
+          includeGuildObject: false,
+        }),
+        client: createGuildTextClient(channelId),
+      }),
+      guildEntries: {
+        "guild-other": {
+          channels: {
+            [channelId]: {
+              enabled: true,
+              requireMention: false,
+            },
+          },
+        },
+      },
+      agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+      onPassiveCaptureAdmissionResolved: recordPassiveCaptureForMessage({
+        fetchImpl: fetchImpl as never,
+        message,
+      }),
+    });
+
+    expect(result).toBeNull();
+    await flushPassiveCapture();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("does not passively capture disallowed guild senders", async () => {
+    const channelId = "channel-passive-sender";
+    const guildId = "guild-passive-sender";
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const message = createDiscordMessage({
+      id: "m-passive-sender",
+      channelId,
+      content: "blocked sender update",
+      author: {
+        id: "user-blocked",
+        bot: false,
+        username: "Mallory",
+      },
+    });
+
+    const result = await preflightDiscordMessage({
+      ...createPreflightArgs({
+        cfg: DEFAULT_PREFLIGHT_CFG,
+        discordConfig: {} as DiscordConfig,
+        data: createGuildEvent({
+          channelId,
+          guildId,
+          author: message.author,
+          message,
+        }),
+        client: createGuildTextClient(channelId),
+      }),
+      guildEntries: {
+        [guildId]: {
+          channels: {
+            [channelId]: {
+              enabled: true,
+              requireMention: false,
+              users: ["user-allowed"],
+            },
+          },
+        },
+      },
+      agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+      onPassiveCaptureAdmissionResolved: recordPassiveCaptureForMessage({
+        fetchImpl: fetchImpl as never,
+        message,
+      }),
+    });
+
+    expect(result).toBeNull();
+    await flushPassiveCapture();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("does not treat categorized text channels as threads during passive capture", async () => {
+    const channelId = "channel-passive-category";
+    const guildId = "guild-passive-category";
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const fetchChannel = vi.fn(async (id: string) => {
+      if (id === channelId) {
+        return {
+          id: channelId,
+          type: ChannelType.GuildText,
+          name: "discussion",
+          parentId: "category-1",
+        };
+      }
+      return null;
+    });
+    const message = createDiscordMessage({
+      id: "m-passive-category",
+      channelId,
+      content: "categorized channel update",
+      author: {
+        id: "user-1",
+        bot: false,
+        username: "Alice",
+      },
+    });
+
+    const result = await preflightDiscordMessage({
+      ...createPreflightArgs({
+        cfg: DEFAULT_PREFLIGHT_CFG,
+        discordConfig: {} as DiscordConfig,
+        data: createGuildEvent({
+          channelId,
+          guildId,
+          author: message.author,
+          message,
+        }),
+        client: { fetchChannel } as unknown as DiscordClient,
+      }),
+      guildEntries: {
+        [guildId]: {
+          channels: {
+            [channelId]: {
+              enabled: true,
+              requireMention: false,
+            },
+          },
+        },
+      },
+      agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+      onPassiveCaptureAdmissionResolved: recordPassiveCaptureForMessage({
+        fetchImpl: fetchImpl as never,
+        message,
+      }),
+    });
+
+    expect(result).not.toBeNull();
+    await flushPassiveCapture();
+    const body = parseFirstCaptureBody(fetchImpl);
+    expect(body).toMatchObject({
+      channel_id: channelId,
+      channel_type: "text",
+      message_id: "m-passive-category",
+    });
+    expect(body).not.toHaveProperty("thread_id");
+  });
+
+  it("routes real thread passive capture to its parent channel", async () => {
+    const threadId = "thread-passive-capture";
+    const parentId = "parent-passive-capture";
+    const guildId = "guild-passive-thread";
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const message = createDiscordMessage({
+      id: "m-passive-thread",
+      channelId: threadId,
+      content: "thread update",
+      author: {
+        id: "user-1",
+        bot: false,
+        username: "Alice",
+      },
+    });
+
+    const result = await preflightDiscordMessage({
+      ...createPreflightArgs({
+        cfg: DEFAULT_PREFLIGHT_CFG,
+        discordConfig: {} as DiscordConfig,
+        data: createGuildEvent({
+          channelId: threadId,
+          guildId,
+          author: message.author,
+          message,
+        }),
+        client: createThreadClient({
+          threadId,
+          parentId,
+        }),
+      }),
+      guildEntries: {
+        [guildId]: {
+          channels: {
+            [parentId]: {
+              enabled: true,
+              requireMention: false,
+            },
+          },
+        },
+      },
+      agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+      onPassiveCaptureAdmissionResolved: recordPassiveCaptureForMessage({
+        fetchImpl: fetchImpl as never,
+        message,
+      }),
+    });
+
+    expect(result).not.toBeNull();
+    await flushPassiveCapture();
+    expect(parseFirstCaptureBody(fetchImpl)).toMatchObject({
+      channel_id: parentId,
+      channel_type: "thread",
+      thread_id: threadId,
+      message_id: "m-passive-thread",
+    });
+  });
+
+  it("does not add uncached REST channel lookups for passive capture", async () => {
+    const channelId = "channel-passive-cache";
+    const guildId = "guild-passive-cache";
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const fetchChannel = vi.fn(async (id: string) => {
+      if (id === channelId) {
+        return {
+          id: channelId,
+          type: ChannelType.GuildText,
+          name: "discussion",
+        };
+      }
+      return null;
+    });
+    const client = { fetchChannel } as unknown as DiscordClient;
+
+    for (const messageId of ["m-passive-cache-1", "m-passive-cache-2"]) {
+      const message = createDiscordMessage({
+        id: messageId,
+        channelId,
+        content: `cache check ${messageId}`,
+        author: {
+          id: "user-1",
+          bot: false,
+          username: "Alice",
+        },
+      });
+
+      const result = await preflightDiscordMessage({
+        ...createPreflightArgs({
+          cfg: DEFAULT_PREFLIGHT_CFG,
+          discordConfig: {} as DiscordConfig,
+          data: createGuildEvent({
+            channelId,
+            guildId,
+            author: message.author,
+            message,
+          }),
+          client,
+        }),
+        guildEntries: {
+          [guildId]: {
+            channels: {
+              [channelId]: {
+                enabled: true,
+                requireMention: false,
+              },
+            },
+          },
+        },
+        agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+        onPassiveCaptureAdmissionResolved: recordPassiveCaptureForMessage({
+          fetchImpl: fetchImpl as never,
+          message,
+        }),
+      });
+      expect(result).not.toBeNull();
+    }
+
+    await flushPassiveCapture();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fetchChannel).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps passive capture request failures isolated from preflight acceptance", async () => {
+    const channelId = "channel-passive-failure";
+    const guildId = "guild-passive-failure";
+    const fetchImpl = vi.fn(async () => {
+      throw new Error("capture failed");
+    });
+    const message = createDiscordMessage({
+      id: "m-passive-failure",
+      channelId,
+      content: "capture can fail",
+      author: {
+        id: "user-1",
+        bot: false,
+        username: "Alice",
+      },
+    });
+
+    const result = await preflightDiscordMessage({
+      ...createPreflightArgs({
+        cfg: DEFAULT_PREFLIGHT_CFG,
+        discordConfig: {} as DiscordConfig,
+        data: createGuildEvent({
+          channelId,
+          guildId,
+          author: message.author,
+          message,
+        }),
+        client: createGuildTextClient(channelId),
+      }),
+      guildEntries: {
+        [guildId]: {
+          channels: {
+            [channelId]: {
+              enabled: true,
+              requireMention: false,
+            },
+          },
+        },
+      },
+      agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+      onPassiveCaptureAdmissionResolved: recordPassiveCaptureForMessage({
+        fetchImpl: fetchImpl as never,
+        message,
+      }),
+    });
+
+    expect(result).not.toBeNull();
+    await flushPassiveCapture();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
   it("keeps unmentioned abort requests as user requests when room events are enabled", async () => {

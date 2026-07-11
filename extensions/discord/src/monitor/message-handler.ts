@@ -18,6 +18,12 @@ import {
 import { buildDiscordInboundJob, resolveDiscordInboundJobQueueKey } from "./inbound-job.js";
 import type { DiscordMessageEvent, DiscordMessageHandler } from "./listeners.js";
 import { applyImplicitReplyBatchGate } from "./message-handler.batch-gate.js";
+import { hydrateDiscordMessageIfNeeded } from "./message-handler.hydration.js";
+import {
+  captureAcceptedAgentWorkerDiscordMessage,
+  type DiscordPassiveCaptureAdmission,
+} from "./message-handler.passive-capture.js";
+import { resolveDiscordPreflightPluralKitInfo } from "./message-handler.preflight-pluralkit.js";
 import type {
   DiscordMessagePreflightContext,
   DiscordMessagePreflightParams,
@@ -36,6 +42,7 @@ import {
   createDiscordReplyTypingFeedback,
   type DiscordReplyTypingFeedback,
 } from "./reply-typing-feedback.js";
+import { resolveDiscordSenderIdentity } from "./sender-identity.js";
 import type { DiscordMonitorStatusSink } from "./status.js";
 
 type PreflightDiscordMessage =
@@ -59,6 +66,13 @@ type DiscordMessageHandlerTestingHooks = DiscordMessageRunQueueTestingHooks & {
 type PrestartedTypingFeedbackEntry = {
   channelId: string;
   feedback: DiscordReplyTypingFeedback;
+};
+
+type DiscordDebouncedMessageEntry = {
+  data: DiscordMessageEvent;
+  client: Client;
+  abortSignal?: AbortSignal;
+  replayKey?: string;
 };
 
 let messagePreflightRuntimePromise:
@@ -124,6 +138,105 @@ function startAcceptedTypingFeedback(params: {
   return replyTypingFeedback;
 }
 
+async function resolvePassiveCaptureMessage(params: {
+  admission: DiscordPassiveCaptureAdmission;
+  discordConfig: DiscordMessageHandlerParams["discordConfig"];
+  entry: DiscordDebouncedMessageEntry;
+  useResolvedAdmission: boolean;
+}): Promise<{
+  admission: DiscordPassiveCaptureAdmission;
+  messageId: string;
+  content: string;
+} | null> {
+  if (params.useResolvedAdmission) {
+    const messageId = params.admission.resolvedMessageId?.trim();
+    if (!messageId) {
+      return null;
+    }
+    return {
+      admission: params.admission,
+      messageId,
+      content: params.admission.resolvedContent ?? "",
+    };
+  }
+
+  const message = params.entry.data.message;
+  const messageChannelId =
+    resolveDiscordMessageChannelId({
+      message,
+      eventChannelId: params.entry.data.channel_id,
+    }) ?? params.admission.sourceChannelId;
+  const hydratedMessage = await hydrateDiscordMessageIfNeeded({
+    client: params.entry.client,
+    message,
+    messageChannelId,
+  });
+  const messageId = hydratedMessage.id?.trim();
+  if (!messageId) {
+    return null;
+  }
+  const author = params.entry.data.author ?? hydratedMessage.author;
+  if (!author) {
+    return null;
+  }
+  const pluralkitInfo = await resolveDiscordPreflightPluralKitInfo({
+    message: hydratedMessage,
+    config: params.discordConfig?.pluralkit,
+    abortSignal: params.entry.abortSignal,
+  });
+  const sender = resolveDiscordSenderIdentity({
+    author,
+    member: params.entry.data.member,
+    pluralkitInfo,
+  });
+  return {
+    admission: {
+      ...params.admission,
+      authorId: author.id,
+      authorIsBot: Boolean(author.bot),
+      sender,
+    },
+    messageId,
+    content: resolveDiscordMessageText(hydratedMessage, {
+      includeForwarded: true,
+    }),
+  };
+}
+
+async function capturePassiveDiscordMessages(params: {
+  capture: DiscordMessageHandlerParams["agentWorkerCapture"];
+  admission?: DiscordPassiveCaptureAdmission;
+  discordConfig: DiscordMessageHandlerParams["discordConfig"];
+  entries: DiscordDebouncedMessageEntry[];
+}) {
+  if (!params.admission) {
+    return;
+  }
+  const useResolvedAdmission = params.entries.length === 1;
+  for (const entry of params.entries) {
+    try {
+      const resolved = await resolvePassiveCaptureMessage({
+        admission: params.admission,
+        discordConfig: params.discordConfig,
+        entry,
+        useResolvedAdmission,
+      });
+      if (!resolved) {
+        continue;
+      }
+      void captureAcceptedAgentWorkerDiscordMessage({
+        capture: params.capture,
+        ...resolved.admission,
+        messageId: resolved.messageId,
+        content: resolved.content,
+      });
+    } catch {
+      // Passive capture cannot affect Discord admission, debounce, or dispatch.
+      continue;
+    }
+  }
+}
+
 export function createDiscordMessageHandler(
   params: DiscordMessageHandlerParams,
 ): DiscordMessageHandlerWithLifecycle {
@@ -149,12 +262,7 @@ export function createDiscordMessageHandler(
     testing: params.testing,
   });
 
-  const { debouncer } = createChannelInboundDebouncer<{
-    data: DiscordMessageEvent;
-    client: Client;
-    abortSignal?: AbortSignal;
-    replayKey?: string;
-  }>({
+  const { debouncer } = createChannelInboundDebouncer<DiscordDebouncedMessageEntry>({
     cfg: params.cfg,
     channel: "discord",
     buildKey: (entry) => {
@@ -202,6 +310,7 @@ export function createDiscordMessageHandler(
         return;
       }
       try {
+        let passiveCaptureAdmission: DiscordPassiveCaptureAdmission | undefined;
         if (entries.length === 1) {
           const preflight =
             preflightDiscordMessageImpl ??
@@ -213,6 +322,15 @@ export function createDiscordMessageHandler(
             abortSignal,
             data: last.data,
             client: last.client,
+            onPassiveCaptureAdmissionResolved: (admission) => {
+              passiveCaptureAdmission = admission;
+            },
+          });
+          void capturePassiveDiscordMessages({
+            capture: params.agentWorkerCapture,
+            admission: passiveCaptureAdmission,
+            discordConfig: params.discordConfig,
+            entries,
           });
           if (!ctx) {
             await commitDiscordInboundReplay({ replayKeys, replayGuard });
@@ -269,6 +387,15 @@ export function createDiscordMessageHandler(
           abortSignal,
           data: syntheticData,
           client: last.client,
+          onPassiveCaptureAdmissionResolved: (admission) => {
+            passiveCaptureAdmission = admission;
+          },
+        });
+        void capturePassiveDiscordMessages({
+          capture: params.agentWorkerCapture,
+          admission: passiveCaptureAdmission,
+          discordConfig: params.discordConfig,
+          entries,
         });
         if (!ctx) {
           await commitDiscordInboundReplay({ replayKeys, replayGuard });

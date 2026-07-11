@@ -75,6 +75,51 @@ function createMessageData(messageId: string, channelId = "ch-1") {
   };
 }
 
+function createTextMessageData(params: {
+  messageId: string;
+  channelId?: string;
+  content: string;
+  mentionedUsers?: Array<{ id: string }>;
+}) {
+  const channelId = params.channelId ?? "ch-1";
+  return {
+    channel_id: channelId,
+    guild_id: "guild-1",
+    author: { id: "user-1", bot: false, username: "Alice" },
+    message: {
+      id: params.messageId,
+      author: { id: "user-1", bot: false, username: "Alice" },
+      content: params.content,
+      channel_id: channelId,
+      attachments: [],
+      mentionedUsers: params.mentionedUsers ?? [],
+      mentionedRoles: [],
+      mentionedEveryone: false,
+    },
+  };
+}
+
+function createAgentWorkerCapture(fetchImpl: typeof fetch) {
+  return {
+    env: {
+      AGENT_WORKER_BASE_URL: "http://worker:8788",
+      AGENT_WORKER_BRIDGE_TOKEN: "test-token",
+      AGENT_WORKER_WORKSPACE_KEY: "homming",
+    },
+    fetchImpl,
+  };
+}
+
+function parseCaptureBodies(fetchImpl: { mock: { calls: unknown[][] } }) {
+  return fetchImpl.mock.calls.map((call) => {
+    const request = call[1] as RequestInit | undefined;
+    if (!request) {
+      throw new Error("expected capture request");
+    }
+    return JSON.parse(String(request.body)) as Record<string, unknown>;
+  });
+}
+
 function createPreflightContext(channelId = "ch-1") {
   const discordConfig = {
     enabled: true,
@@ -147,6 +192,39 @@ function createHandlerWithDefaultPreflight(overrides?: { setStatus?: SetStatusFn
 function installDefaultDiscordPreflight() {
   preflightDiscordMessageMock.mockImplementation(async (params: { data: { channel_id: string } }) =>
     createPreflightContext(params.data.channel_id),
+  );
+}
+
+function installPassiveCapturePreflight() {
+  preflightDiscordMessageMock.mockImplementation(
+    async (params: {
+      data: { channel_id: string; message?: { id?: string; content?: string } };
+      onPassiveCaptureAdmissionResolved?: (admission: {
+        guildId?: string;
+        sourceChannelId: string;
+        resolvedMessageId?: string;
+        resolvedContent?: string;
+        authorId: string;
+        authorIsBot: boolean;
+        sender: { id: string; label: string; isPluralKit: boolean };
+        threadChannel: null;
+      }) => void;
+    }) => {
+      params.onPassiveCaptureAdmissionResolved?.({
+        guildId: "guild-1",
+        sourceChannelId: params.data.channel_id,
+        resolvedMessageId: params.data.message?.id,
+        resolvedContent: params.data.message?.content ?? "hello",
+        authorId: "user-1",
+        authorIsBot: false,
+        sender: { id: "user-1", label: "Alice", isPluralKit: false },
+        threadChannel: null,
+      });
+      return {
+        ...createPreflightContext(params.data.channel_id),
+        messageText: params.data.message?.content ?? "hello",
+      };
+    },
   );
 }
 
@@ -290,6 +368,36 @@ describe("createDiscordMessageHandler queue behavior", () => {
 
     expect(createReplyTypingFeedback).not.toHaveBeenCalled();
     expect(processDiscordMessageMock).not.toHaveBeenCalled();
+  });
+
+  it("passively captures a normally accepted mentioned message once", async () => {
+    preflightDiscordMessageMock.mockReset();
+    processDiscordMessageMock.mockReset();
+    installPassiveCapturePreflight();
+    processDiscordMessageMock.mockResolvedValue(undefined);
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+
+    const handler = createDiscordMessageHandler({
+      ...createDiscordHandlerParams(),
+      agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+    });
+    await handler(
+      createTextMessageData({
+        messageId: "m-mentioned-once",
+        content: "status please",
+        mentionedUsers: [{ id: "bot-123" }],
+      }) as never,
+      {} as never,
+    );
+    await flushQueueWork();
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(parseCaptureBodies(fetchImpl)).toEqual([
+      expect.objectContaining({
+        message_id: "m-mentioned-once",
+        content: "status please",
+      }),
+    ]);
   });
 
   it.each(["message", "thinking", "never"] as const)(
@@ -788,6 +896,67 @@ describe("createDiscordMessageHandler queue behavior", () => {
     await flushQueueWork();
     expect(processDiscordMessageMock).toHaveBeenCalledTimes(2);
     expect(processedMessageIds).toEqual(["m-1", "m-2"]);
+  });
+
+  it("passively captures debounced originals instead of one synthetic combined message", async () => {
+    vi.useFakeTimers();
+    preflightDiscordMessageMock.mockReset();
+    processDiscordMessageMock.mockReset();
+    installPassiveCapturePreflight();
+    processDiscordMessageMock.mockResolvedValue(undefined);
+    const fetchImpl = vi.fn(async () => new Response("{}", { status: 200 }));
+    const baseParams = createDiscordHandlerParams();
+
+    const handler = createDiscordMessageHandler({
+      ...baseParams,
+      cfg: {
+        ...baseParams.cfg,
+        messages: {
+          inbound: {
+            debounceMs: 25,
+          },
+        },
+      },
+      agentWorkerCapture: createAgentWorkerCapture(fetchImpl as never),
+    });
+    const first = handler(
+      createTextMessageData({
+        messageId: "m-debounce-1",
+        content: "first original",
+      }) as never,
+      {} as never,
+    );
+    const second = handler(
+      createTextMessageData({
+        messageId: "m-debounce-2",
+        content: "second original",
+      }) as never,
+      {} as never,
+    );
+
+    await vi.advanceTimersByTimeAsync(25);
+    await Promise.all([first, second]);
+    await flushQueueWork();
+
+    expect(processDiscordMessageMock).toHaveBeenCalledTimes(1);
+    expect(preflightDiscordMessageMock).toHaveBeenCalledTimes(1);
+    const bodies = parseCaptureBodies(fetchImpl);
+    expect(bodies).toEqual([
+      expect.objectContaining({
+        message_id: "m-debounce-1",
+        content: "first original",
+      }),
+      expect.objectContaining({
+        message_id: "m-debounce-2",
+        content: "second original",
+      }),
+    ]);
+    expect(bodies).not.toContainEqual(
+      expect.objectContaining({
+        message_id: "m-debounce-2",
+        content: "first original\nsecond original",
+      }),
+    );
   });
 
   it("recovers queue progress after a run failure without leaving busy state stuck", async () => {

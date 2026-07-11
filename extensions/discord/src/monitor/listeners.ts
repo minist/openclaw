@@ -44,6 +44,7 @@ export class DiscordMessageListener extends MessageCreateListener {
 
   async handle(data: DiscordMessageEvent, client: Client) {
     this.onEvent?.();
+
     // Fire-and-forget: hand off to the handler without blocking gateway dispatch.
     // Per-session ordering is owned by the message run queue.
     void Promise.resolve()

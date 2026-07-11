@@ -7,12 +7,14 @@ import type { HistoryEntry } from "openclaw/plugin-sdk/reply-history";
 import type { resolveAgentRoute } from "openclaw/plugin-sdk/routing";
 import type { ChannelType, Client, User } from "../internal/discord.js";
 import type { DiscordChannelConfigResolved, DiscordGuildEntryResolved } from "./allow-list.js";
+import type { AgentWorkerDiscordCaptureOptions } from "./message-handler.passive-capture.js";
 import type { DiscordChannelInfo } from "./message-utils.js";
 import type { DiscordThreadBindingLookup } from "./reply-delivery.js";
 import type { DiscordReplyTypingFeedback } from "./reply-typing-feedback.js";
 import type { DiscordSenderIdentity } from "./sender-identity.js";
 
 export type { DiscordSenderIdentity } from "./sender-identity.js";
+import type { DiscordPassiveCaptureAdmission } from "./message-handler.passive-capture.js";
 import type { DiscordThreadChannel } from "./threading.js";
 
 type LoadedConfig = OpenClawConfig;
@@ -113,6 +115,8 @@ export type DiscordMessagePreflightParams = DiscordMessagePreflightSharedFields 
   groupPolicy: DiscordMessagePreflightContext["groupPolicy"];
   threadBindings: DiscordThreadBindingLookup;
   discordRestFetch?: typeof fetch;
+  agentWorkerCapture?: AgentWorkerDiscordCaptureOptions;
+  onPassiveCaptureAdmissionResolved?: (admission: DiscordPassiveCaptureAdmission) => void;
   data: DiscordMessageEvent;
   client: Client;
 };
